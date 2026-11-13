@@ -45,6 +45,25 @@ pub enum ZipError {
     /// That happens when an entry uses a data descriptor, or when the sum of the
     /// declared sizes overflows.
     DecompressedSizeUnknown,
+
+    /// The archive holds more entries than the limit passed to
+    /// [`ExtractOptions::with_entry_limit`](crate::read::ExtractOptions::with_entry_limit).
+    EntryLimitExceeded {
+        /// Number of entries in the archive.
+        entries: u64,
+        /// Limit passed by the caller.
+        limit: u64,
+    },
+
+    /// An entry's path, relative to the destination directory, is deeper than
+    /// the limit passed to
+    /// [`ExtractOptions::with_depth_limit`](crate::read::ExtractOptions::with_depth_limit).
+    DepthLimitExceeded {
+        /// Number of path components below the destination directory.
+        depth: u64,
+        /// Limit passed by the caller.
+        limit: u64,
+    },
 }
 
 impl ZipError {
@@ -81,6 +100,14 @@ impl Clone for ZipError {
                 }
             }
             ZipError::DecompressedSizeUnknown => ZipError::DecompressedSizeUnknown,
+            ZipError::EntryLimitExceeded { entries, limit } => ZipError::EntryLimitExceeded {
+                entries: *entries,
+                limit: *limit,
+            },
+            ZipError::DepthLimitExceeded { depth, limit } => ZipError::DepthLimitExceeded {
+                depth: *depth,
+                limit: *limit,
+            },
         }
     }
 }
@@ -102,6 +129,12 @@ impl Display for ZipError {
             Self::DecompressedSizeUnknown => {
                 f.write_str("decompressed size is unknown, so a size limit cannot be checked")
             }
+            Self::EntryLimitExceeded { entries, limit } => {
+                write!(f, "entry count {entries} exceeds limit {limit}")
+            }
+            Self::DepthLimitExceeded { depth, limit } => {
+                write!(f, "entry path depth {depth} exceeds limit {limit}")
+            }
         }
     }
 }
@@ -116,7 +149,9 @@ impl Error for ZipError {
             | Self::InvalidPassword
             | Self::CompressionMethodNotSupported(_)
             | Self::DecompressedSizeLimitExceeded { .. }
-            | Self::DecompressedSizeUnknown => None,
+            | Self::DecompressedSizeUnknown
+            | Self::EntryLimitExceeded { .. }
+            | Self::DepthLimitExceeded { .. } => None,
         }
     }
 }
@@ -132,7 +167,9 @@ impl From<ZipError> for io::Error {
             ZipError::FileNotFound => io::ErrorKind::NotFound,
             ZipError::InvalidPassword
             | ZipError::DecompressedSizeLimitExceeded { .. }
-            | ZipError::DecompressedSizeUnknown => io::ErrorKind::InvalidInput,
+            | ZipError::DecompressedSizeUnknown
+            | ZipError::EntryLimitExceeded { .. }
+            | ZipError::DepthLimitExceeded { .. } => io::ErrorKind::InvalidInput,
         };
 
         io::Error::new(kind, err)

@@ -70,18 +70,35 @@ fn extract_options_size_limit_allows_an_equal_total_and_extract_stays_unlimited(
 }
 
 #[test]
-fn extract_options_size_limit_rejects_an_unknown_total() {
+fn extract_options_size_limit_enforces_actual_bytes_when_the_total_is_unknown() {
     let bytes = include_bytes!("data/data_descriptor.zip");
     let mut archive = open(bytes);
     assert_eq!(archive.decompressed_size(), None);
 
     let dest = TempDir::with_prefix("zip_size_limit_unknown").unwrap();
     let out = dest.path().join("out");
-    let err = archive
-        .extract_with_options(&out, ExtractOptions::default().with_size_limit(u64::MAX))
-        .expect_err("a limit cannot be checked when the declared size is unknown");
 
-    assert!(matches!(err, ZipError::DecompressedSizeUnknown));
+    // The declared total is unknown, so the limit is enforced on the actual
+    // decompressed bytes as they are written: a generous limit extracts fine.
+    archive
+        .extract_with_options(&out, ExtractOptions::default().with_size_limit(u64::MAX))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(out.join("hello.txt")).unwrap(),
+        b"Hello World\n"
+    );
+
+    // A tight limit stops the extraction as soon as the actual bytes exceed
+    // it, and everything created by the call is removed again.
+    let mut archive = open(bytes);
+    let out = dest.path().join("out_tight");
+    let err = archive
+        .extract_with_options(&out, ExtractOptions::default().with_size_limit(5))
+        .expect_err("actual decompressed bytes exceed the limit");
+    assert!(matches!(
+        err,
+        ZipError::DecompressedSizeLimitExceeded { size: 12, limit: 5 }
+    ));
     assert!(!out.exists());
 }
 

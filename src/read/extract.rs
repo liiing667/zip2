@@ -49,6 +49,181 @@ pub(crate) fn copy_into<R: Read + ?Sized, W: Write + ?Sized>(
     Ok(written)
 }
 
+/// Shared quota on the actual number of decompressed bytes written during a
+/// single extraction.
+///
+/// The counter is atomic so that parallel extraction workers charge against
+/// the same limit, making the quota independently verifiable regardless of
+/// how extraction is scheduled.
+#[derive(Debug)]
+pub(crate) struct ByteQuota {
+    limit: u64,
+    used: std::sync::atomic::AtomicU64,
+}
+
+impl ByteQuota {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Charge `bytes` actually decompressed against the quota.
+    fn charge(&self, bytes: u64) -> ZipResult<()> {
+        let used = self
+            .used
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(bytes);
+        if used > self.limit {
+            return Err(ZipError::DecompressedSizeLimitExceeded {
+                size: u128::from(used),
+                limit: self.limit,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Like [`copy_into`], but charges every chunk actually decompressed against
+/// `quota` (when set) before writing it, so an extraction never writes more
+/// than the configured byte limit.
+pub(crate) fn copy_into_with_quota<R: Read + ?Sized, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut [u8],
+    quota: Option<&ByteQuota>,
+) -> ZipResult<u64> {
+    let mut written = 0u64;
+    loop {
+        let n = reader.read(buf)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(quota) = quota {
+            quota.charge(n as u64)?;
+        }
+        writer.write_all(&buf[..n])?;
+        written = written.saturating_add(n as u64);
+    }
+    Ok(written)
+}
+
+/// Filesystem entries created during a single extraction call.
+///
+/// Extraction is not transactional at the filesystem level, but the failure
+/// contract is: when an extraction fails for any reason (quota exceeded,
+/// corrupt data, i/o error), every entry it created is removed again, so the
+/// destination directory is left in its pre-call state. Entries that already
+/// existed before the call are never tracked; a pre-existing file that was
+/// overwritten cannot be restored and is the caller's responsibility.
+#[derive(Default, Debug)]
+pub(crate) struct CreatedPaths {
+    /// Regular files and symlinks created by the extraction.
+    files: Vec<std::path::PathBuf>,
+    /// Topmost directories created by the extraction; everything below them
+    /// was created by the same call.
+    dirs: Vec<std::path::PathBuf>,
+}
+
+impl CreatedPaths {
+    /// Record a file or symlink the extraction is about to create, unless it
+    /// already existed before this call. Must be called before creation.
+    pub(crate) fn track_file(&mut self, path: &Path) {
+        if std::fs::symlink_metadata(path).is_err() {
+            self.files.push(path.to_path_buf());
+        }
+    }
+
+    /// Record the highest not-yet-existing ancestor of `path` (inclusive),
+    /// whose creation is implied by creating `path`. Must be called before
+    /// creation.
+    pub(crate) fn track_created_dir(&mut self, path: &Path) {
+        let mut root = path;
+        while let Some(parent) = root.parent() {
+            if parent.as_os_str().is_empty() || std::fs::symlink_metadata(parent).is_ok() {
+                break;
+            }
+            root = parent;
+        }
+        if std::fs::symlink_metadata(root).is_err() {
+            self.dirs.push(root.to_path_buf());
+        }
+    }
+
+    /// Remove everything recorded, restoring the destination to its pre-call
+    /// state. Best-effort: missing entries are skipped and other failures are
+    /// reported on stderr, mirroring the partial-file cleanup elsewhere.
+    pub(crate) fn rollback(&self) {
+        for file in &self.files {
+            if let Err(err) = std::fs::remove_file(file)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "extract: failed to roll back created file {}: {err:?}",
+                    file.display()
+                );
+            }
+        }
+        // Deepest first, so nested roots recorded separately are gone before
+        // their ancestors are removed.
+        let mut dirs: Vec<&std::path::PathBuf> = self.dirs.iter().collect();
+        dirs.sort_by_key(|path| path.components().count());
+        for dir in dirs.into_iter().rev() {
+            if let Err(err) = std::fs::remove_dir_all(dir)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "extract: failed to roll back created directory {}: {err:?}",
+                    dir.display()
+                );
+            }
+        }
+    }
+}
+
+/// Fail with [`ZipError::DepthLimitExceeded`] when `outpath` sits more than
+/// `depth_limit` components below `directory`.
+fn check_depth_limit(outpath: &Path, directory: &Path, depth_limit: Option<u64>) -> ZipResult<()> {
+    if let Some(limit) = depth_limit {
+        let depth = outpath
+            .strip_prefix(directory)
+            .map(|relative| relative.components().count() as u64)
+            .unwrap_or(0);
+        if depth > limit {
+            return Err(ZipError::DepthLimitExceeded { depth, limit });
+        }
+    }
+    Ok(())
+}
+
+/// Pre-checks that can be verified against the central directory alone,
+/// before anything is written to disk.
+fn check_static_quotas<R: Read + Seek>(
+    archive: &ZipArchive<R>,
+    size_limit: Option<u64>,
+    entry_limit: Option<u64>,
+) -> ZipResult<()> {
+    if let Some(limit) = entry_limit {
+        let entries = archive.len() as u64;
+        if entries > limit {
+            return Err(ZipError::EntryLimitExceeded { entries, limit });
+        }
+    }
+    if let Some(limit) = size_limit {
+        // Fast path: when the declared total is known and already exceeds the
+        // limit, reject up front. When it is unknown (data descriptors or an
+        // overflowing sum), extraction proceeds and the quota is enforced on
+        // the actual decompressed bytes instead.
+        if let Some(size) = archive.decompressed_size()
+            && size > u128::from(limit)
+        {
+            return Err(ZipError::DecompressedSizeLimitExceeded { size, limit });
+        }
+    }
+    Ok(())
+}
+
 /// Symlink extract action
 #[derive(Debug, Default, Copy, Clone)]
 pub enum SymlinkExtractAction {
@@ -84,6 +259,8 @@ pub enum SymlinkExtractAction {
 pub struct ExtractOptions<F = fn(&Path) -> bool> {
     pub(crate) symlink_action: SymlinkExtractAction,
     pub(crate) size_limit: Option<u64>,
+    pub(crate) entry_limit: Option<u64>,
+    pub(crate) depth_limit: Option<u64>,
     pub(crate) enforce_header_consistency: bool,
     pub(crate) root_dir_filter: Option<F>,
 }
@@ -93,6 +270,8 @@ impl<F> core::fmt::Debug for ExtractOptions<F> {
         f.debug_struct("ExtractOptions")
             .field("symlink_action", &self.symlink_action)
             .field("size_limit", &self.size_limit)
+            .field("entry_limit", &self.entry_limit)
+            .field("depth_limit", &self.depth_limit)
             .field(
                 "enforce_header_consistency",
                 &self.enforce_header_consistency,
@@ -110,6 +289,8 @@ impl Default for ExtractOptions {
         Self {
             symlink_action: SymlinkExtractAction::default(),
             size_limit: None,
+            entry_limit: None,
+            depth_limit: None,
             enforce_header_consistency: false,
             root_dir_filter: None,
         }
@@ -144,6 +325,8 @@ impl<F> ExtractOptions<F> {
         ExtractOptions {
             symlink_action: self.symlink_action,
             size_limit: self.size_limit,
+            entry_limit: self.entry_limit,
+            depth_limit: self.depth_limit,
             enforce_header_consistency: self.enforce_header_consistency,
             root_dir_filter: Some(filter),
         }
@@ -158,11 +341,50 @@ impl<F> ExtractOptions<F> {
         }
     }
 
-    /// Set the maximum declared uncompressed size accepted for extraction.
+    /// Set the maximum total number of decompressed bytes accepted for extraction.
+    ///
+    /// The limit is enforced on the actual bytes written to disk, counted as
+    /// entries are decompressed, so it also protects archives whose central
+    /// directory declares sizes that do not match reality (including entries
+    /// with data descriptors, whose sizes are not known up front). When the
+    /// declared total is known and already exceeds the limit, extraction is
+    /// rejected before anything is written.
+    ///
+    /// On violation the extraction fails with
+    /// [`ZipError::DecompressedSizeLimitExceeded`](crate::result::ZipError::DecompressedSizeLimitExceeded)
+    /// and every filesystem entry created by the call is removed again.
     #[must_use]
     pub fn with_size_limit(self, size_limit: u64) -> Self {
         Self {
             size_limit: Some(size_limit),
+            ..self
+        }
+    }
+
+    /// Set the maximum number of archive entries accepted for extraction.
+    ///
+    /// Checked against the central directory before anything is written; on
+    /// violation the extraction fails with
+    /// [`ZipError::EntryLimitExceeded`](crate::result::ZipError::EntryLimitExceeded)
+    /// and the destination is left untouched.
+    #[must_use]
+    pub fn with_entry_limit(self, entry_limit: u64) -> Self {
+        Self {
+            entry_limit: Some(entry_limit),
+            ..self
+        }
+    }
+
+    /// Set the maximum depth (number of path components below the destination
+    /// directory) accepted for an extracted entry.
+    ///
+    /// On violation the extraction fails with
+    /// [`ZipError::DepthLimitExceeded`](crate::result::ZipError::DepthLimitExceeded)
+    /// and every filesystem entry created by the call is removed again.
+    #[must_use]
+    pub fn with_depth_limit(self, depth_limit: u64) -> Self {
+        Self {
+            depth_limit: Some(depth_limit),
             ..self
         }
     }
@@ -655,9 +877,14 @@ impl<R: Read + Seek> ZipArchive<R> {
     /// this does not protect against another process concurrently modifying the destination
     /// directory during extraction.
     ///
-    /// Extraction is not atomic. If an error is encountered, some of the files
-    /// may be left on disk. However, on Unix targets, no newly-created directories with part but
-    /// not all of their contents extracted will be readable, writable or usable as process working
+    /// Extraction is not transactional, but its failure handling is: if an
+    /// error is encountered (including a quota configured with
+    /// [`ExtractOptions`] being exceeded), every filesystem entry the call
+    /// created is removed again, leaving the destination in its pre-call
+    /// state. Files that already existed before the call and were overwritten
+    /// are not restored. While the extraction is in progress, on Unix targets,
+    /// no newly-created directories with part but not all of their contents
+    /// extracted will be readable, writable or usable as process working
     /// directories by any non-root user except you.
     ///
     /// Extraction is also not atomic in term of permissions. Permissions are applied after the
@@ -761,31 +988,47 @@ impl<R: Read + Seek> ZipArchive<R> {
         directory: P,
         extract_options: ExtractOptions<impl RootDirFilter>,
     ) -> ZipResult<()> {
+        if extract_options.enforce_header_consistency {
+            self.validate_header_consistency()?;
+        }
+        check_static_quotas(
+            self,
+            extract_options.size_limit,
+            extract_options.entry_limit,
+        )?;
+
+        // Track everything this call creates, so that any failure below
+        // restores the destination to its pre-call state.
+        let mut created = CreatedPaths::default();
+        created.track_created_dir(directory.as_ref());
+        let result = self.extract_guarded(directory.as_ref(), extract_options, &mut created);
+        if result.is_err() {
+            created.rollback();
+        }
+        result
+    }
+
+    fn extract_guarded(
+        &mut self,
+        directory: &Path,
+        extract_options: ExtractOptions<impl RootDirFilter>,
+        created: &mut CreatedPaths,
+    ) -> ZipResult<()> {
         use std::fs;
 
         let ExtractOptions {
             symlink_action,
             size_limit,
+            depth_limit,
             enforce_header_consistency,
             root_dir_filter,
+            ..
         } = extract_options;
 
-        if enforce_header_consistency {
-            self.validate_header_consistency()?;
-        }
-
-        if let Some(limit) = size_limit {
-            match self.decompressed_size() {
-                Some(size) if size > u128::from(limit) => {
-                    return Err(ZipError::DecompressedSizeLimitExceeded { size, limit });
-                }
-                None => return Err(ZipError::DecompressedSizeUnknown),
-                Some(_) => {}
-            }
-        }
-
-        fs::create_dir_all(&directory)?;
-        let directory = directory.as_ref().canonicalize()?;
+        fs::create_dir_all(directory)?;
+        let directory = directory.canonicalize()?;
+        let quota = size_limit.map(ByteQuota::new);
+        let quota = quota.as_ref();
 
         let root_dir = root_dir_filter
             .and_then(|filter| {
@@ -820,7 +1063,9 @@ impl<R: Read + Seek> ZipArchive<R> {
                 .enforce_header_consistency(enforce_header_consistency);
             let mut file = self.by_index_with_options(i, read_options)?;
 
-            let outpath = file.safe_prepare_path(directory.as_ref(), root_dir.as_ref())?;
+            let outpath =
+                file.safe_prepare_path_tracked(directory.as_ref(), root_dir.as_ref(), created)?;
+            check_depth_limit(&outpath, directory.as_ref(), depth_limit)?;
 
             if file.is_symlink() {
                 // `file.size()` is the uncompressed size declared in the central
@@ -839,6 +1084,9 @@ impl<R: Read + Seek> ZipArchive<R> {
                 }
                 let mut target = Vec::with_capacity(declared_len as usize);
                 file.read_to_end(&mut target)?;
+                if let Some(quota) = quota {
+                    quota.charge(target.len() as u64)?;
+                }
                 let unix_mode = file.unix_mode();
                 drop(file);
                 match symlink_action {
@@ -846,13 +1094,16 @@ impl<R: Read + Seek> ZipArchive<R> {
                         // do nothing
                     }
                     SymlinkExtractAction::ExtractAsFile => {
+                        created.track_file(&outpath);
                         make_symlink_as_file(&outpath, &target, unix_mode)?;
                     }
                     SymlinkExtractAction::ExtractAsFileUtf8 => {
+                        created.track_file(&outpath);
                         make_symlink_as_file_utf8(&outpath, &target, unix_mode)?;
                     }
                     #[cfg(any(unix, windows))]
                     SymlinkExtractAction::ExtractRecursiveInFolder => {
+                        created.track_file(&outpath);
                         make_symlink(
                             directory.as_ref(),
                             &outpath,
@@ -863,6 +1114,7 @@ impl<R: Read + Seek> ZipArchive<R> {
                     }
                     #[cfg(any(unix, windows))]
                     SymlinkExtractAction::ExtractInFolder => {
+                        created.track_file(&outpath);
                         make_symlink(
                             directory.as_ref(),
                             &outpath,
@@ -876,11 +1128,13 @@ impl<R: Read + Seek> ZipArchive<R> {
                         let Ok(target_str) = std::str::from_utf8(&target) else {
                             return Err(invalid!("Invalid UTF-8 as symlink target"));
                         };
+                        created.track_file(&outpath);
                         make_symlink_impl(&outpath, target_str, &self.shared.files)?;
                     }
                 }
             } else if file.is_dir() {
                 if created_dirs.insert(outpath.clone()) {
+                    created.track_created_dir(&outpath);
                     make_writable_dir_all(&outpath)?;
                 }
                 // Check for real permissions, which we'll set in a second pass.
@@ -888,6 +1142,7 @@ impl<R: Read + Seek> ZipArchive<R> {
                     files_by_unix_mode.add_mode(outpath, mode);
                 }
             } else {
+                created.track_file(&outpath);
                 let mut outfile = create_outfile(&outpath, file.unix_mode())?;
                 let uncompressed_len = file.size();
                 let mut preallocated_len = 0u64;
@@ -897,7 +1152,8 @@ impl<R: Read + Seek> ZipArchive<R> {
                         preallocated_len = alloc_len;
                     }
                 }
-                let copy_res = copy_into(&mut file, &mut outfile, &mut extract_buf);
+                let copy_res =
+                    copy_into_with_quota(&mut file, &mut outfile, &mut extract_buf, quota);
                 if preallocated_len > 0 {
                     let actual_len = match &copy_res {
                         Ok(extracted) => *extracted,
@@ -917,7 +1173,7 @@ impl<R: Read + Seek> ZipArchive<R> {
                             outpath.display()
                         );
                     }
-                    return Err(e.into());
+                    return Err(e);
                 }
                 #[cfg(unix)]
                 if let Some(mode) = file.unix_mode() {
@@ -1062,25 +1318,50 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
         F: Fn() -> std::io::Result<R> + Sync + Send,
         Filter: RootDirFilter,
     {
+        check_static_quotas(
+            self,
+            extract_options.size_limit,
+            extract_options.entry_limit,
+        )?;
+
+        // Track everything this call creates, so that any failure below
+        // (including in a parallel worker) restores the destination to its
+        // pre-call state.
+        let mut created = CreatedPaths::default();
+        created.track_created_dir(directory);
+        let result =
+            self.par_extract_guarded(directory, reader_factory, extract_options, &mut created);
+        if result.is_err() {
+            created.rollback();
+        }
+        result
+    }
+
+    #[cfg(feature = "rayon")]
+    fn par_extract_guarded<F, Filter>(
+        &mut self,
+        directory: &Path,
+        reader_factory: &F,
+        extract_options: ExtractOptions<Filter>,
+        created: &mut CreatedPaths,
+    ) -> ZipResult<()>
+    where
+        F: Fn() -> std::io::Result<R> + Sync + Send,
+        Filter: RootDirFilter,
+    {
         let ExtractOptions {
             symlink_action,
             size_limit,
+            depth_limit,
             enforce_header_consistency,
             root_dir_filter,
+            ..
         } = extract_options;
-
-        if let Some(limit) = size_limit {
-            match self.decompressed_size() {
-                Some(size) if size > u128::from(limit) => {
-                    return Err(ZipError::DecompressedSizeLimitExceeded { size, limit });
-                }
-                None => return Err(ZipError::DecompressedSizeUnknown),
-                Some(_) => {}
-            }
-        }
 
         std::fs::create_dir_all(directory)?;
         let directory = directory.canonicalize()?;
+        let quota = size_limit.map(ByteQuota::new);
+        let quota = quota.as_ref();
 
         let root_dir = root_dir_filter
             .and_then(|filter| {
@@ -1119,7 +1400,9 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
                 data,
                 directory.as_ref(),
                 root_dir.as_ref(),
+                Some(&mut *created),
             )?;
+            check_depth_limit(&outpath, directory.as_ref(), depth_limit)?;
 
             if data.is_symlink() {
                 let read_options = crate::read::ZipReadOptions::new()
@@ -1135,19 +1418,25 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
                 }
                 let mut target = Vec::with_capacity(declared_len as usize);
                 file.read_to_end(&mut target)?;
+                if let Some(quota) = quota {
+                    quota.charge(target.len() as u64)?;
+                }
                 let unix_mode = file.unix_mode();
                 drop(file);
                 match symlink_action {
                     SymlinkExtractAction::NoExtract => {}
                     SymlinkExtractAction::ExtractAsFile => {
+                        created.track_file(&outpath);
                         make_symlink_as_file(&outpath, &target, unix_mode)?;
                     }
                     SymlinkExtractAction::ExtractAsFileUtf8 => {
+                        created.track_file(&outpath);
                         make_symlink_as_file_utf8(&outpath, &target, unix_mode)?;
                     }
                     #[cfg(any(unix, windows))]
                     SymlinkExtractAction::ExtractRecursiveInFolder
                     | SymlinkExtractAction::ExtractInFolder => {
+                        created.track_file(&outpath);
                         make_symlink(
                             directory.as_ref(),
                             &outpath,
@@ -1161,11 +1450,13 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
                         let Ok(target_str) = std::str::from_utf8(&target) else {
                             return Err(invalid!("Invalid UTF-8 as symlink target"));
                         };
+                        created.track_file(&outpath);
                         make_symlink_impl(&outpath, target_str, &self.shared.files)?;
                     }
                 }
             } else if data.is_dir(file_name_raw) {
                 if created_dirs.insert(outpath.clone()) {
+                    created.track_created_dir(&outpath);
                     make_writable_dir_all(&outpath)?;
                 }
                 if let Some(mode) = data.unix_mode() {
@@ -1180,6 +1471,10 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
 
         let regular_files_vec: Vec<(std::path::PathBuf, usize)> =
             regular_files.into_iter().collect();
+
+        // Workers record the files they create through the mutex, so a
+        // failure in any worker still rolls back what the others wrote.
+        let created = std::sync::Mutex::new(created);
 
         let regular_file_results: ZipResult<Vec<(std::path::PathBuf, Option<u32>)>> =
             regular_files_vec
@@ -1208,6 +1503,11 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
                             .enforce_header_consistency(enforce_header_consistency);
                         let mut file = archive.by_index_with_options(idx, read_options)?;
 
+                        {
+                            let mut created =
+                                created.lock().unwrap_or_else(|err| err.into_inner());
+                            created.track_file(&outpath);
+                        }
                         let mut outfile = create_outfile(&outpath, file.unix_mode())?;
                         let uncompressed_len = file.size();
                         let mut preallocated_len = 0u64;
@@ -1219,7 +1519,7 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
                             }
                         }
 
-                        let copy_res = copy_into(&mut file, &mut outfile, buf);
+                        let copy_res = copy_into_with_quota(&mut file, &mut outfile, buf, quota);
                         if preallocated_len > 0 {
                             let actual_len = match &copy_res {
                                 Ok(extracted) => *extracted,
@@ -1239,7 +1539,7 @@ impl<R: Read + Seek + Send> ZipArchive<R> {
                                     outpath.display()
                                 );
                             }
-                            return Err(e.into());
+                            return Err(e);
                         }
 
                         #[cfg(feature = "chrono")]

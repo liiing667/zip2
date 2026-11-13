@@ -291,3 +291,303 @@ fn test_zip_slip_relative_traversal_rejected_by_extract() {
     );
     let _ = res;
 }
+
+/// Acceptance tests for the extraction quota and failure-handling contract:
+/// quotas are checked against actual decompressed bytes, entry counts and
+/// path depths; any limit violation or mid-extraction failure returns a
+/// stable error and leaves the destination in its pre-call state.
+mod quota_contract {
+    use std::io::{Cursor, Write};
+    use tempfile::TempDir;
+    use zip::read::ExtractOptions;
+    use zip::result::ZipError;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    fn stored_archive(parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, bytes) in parts {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// A streaming writer cannot seek back to fill in sizes, so every file
+    /// entry gets a data descriptor and the declared decompressed total is
+    /// unknown up front.
+    fn streaming_archive(parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new_stream(Vec::new());
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, bytes) in parts {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// Corrupt the payload of the entry whose content is `payload`, so that
+    /// reading it fails the CRC check mid-extraction.
+    fn corrupt_payload(mut zip_bytes: Vec<u8>, payload: &[u8]) -> Vec<u8> {
+        let pos = zip_bytes
+            .windows(payload.len())
+            .position(|window| window == payload)
+            .expect("payload must appear verbatim in a stored archive");
+        zip_bytes[pos] ^= 0xFF;
+        zip_bytes
+    }
+
+    fn assert_dir_contains_only(dir: &std::path::Path, expected: &[&str]) {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        let mut expected: Vec<&str> = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(found, expected, "unexpected destination contents");
+    }
+
+    #[test]
+    fn size_limit_counts_actual_bytes_when_declared_total_is_unknown() {
+        let bytes = streaming_archive(&[("a.txt", b"0123456789"), ("b.txt", b"0123456789")]);
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        assert_eq!(
+            archive.decompressed_size(),
+            None,
+            "data descriptors must hide the declared total"
+        );
+
+        let dest = TempDir::with_prefix("zip_quota_actual_bytes").unwrap();
+        let out = dest.path().join("out");
+        let err = archive
+            .extract_with_options(&out, ExtractOptions::default().with_size_limit(15))
+            .expect_err("actual decompressed bytes exceed the limit");
+
+        assert!(
+            matches!(
+                err,
+                ZipError::DecompressedSizeLimitExceeded {
+                    size: 20,
+                    limit: 15
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !out.exists(),
+            "failed extraction must not leave a half-written destination"
+        );
+    }
+
+    #[test]
+    fn size_limit_allows_exact_actual_total_when_declared_total_is_unknown() {
+        let bytes = streaming_archive(&[("a.txt", b"0123456789"), ("b.txt", b"0123456789")]);
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        assert_eq!(archive.decompressed_size(), None);
+
+        let dest = TempDir::with_prefix("zip_quota_actual_exact").unwrap();
+        let out = dest.path().join("out");
+        archive
+            .extract_with_options(&out, ExtractOptions::default().with_size_limit(20))
+            .unwrap();
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"0123456789");
+        assert_eq!(std::fs::read(out.join("b.txt")).unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn entry_limit_rejects_before_writing_anything() {
+        let bytes = stored_archive(&[("a.txt", b"aaa"), ("b.txt", b"bbb"), ("c.txt", b"ccc")]);
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+
+        let dest = TempDir::with_prefix("zip_quota_entries").unwrap();
+        let out = dest.path().join("out");
+        let err = archive
+            .extract_with_options(&out, ExtractOptions::default().with_entry_limit(2))
+            .expect_err("entry count exceeds the limit");
+
+        assert!(
+            matches!(
+                err,
+                ZipError::EntryLimitExceeded {
+                    entries: 3,
+                    limit: 2
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(!out.exists(), "rejection must not create the destination");
+
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        archive
+            .extract_with_options(&out, ExtractOptions::default().with_entry_limit(3))
+            .unwrap();
+        assert_dir_contains_only(&out, &["a.txt", "b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn depth_limit_violation_rolls_back_everything_created() {
+        let bytes = stored_archive(&[("ok.txt", b"ok"), ("sub/deep.txt", b"too deep")]);
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+
+        let dest = TempDir::with_prefix("zip_quota_depth").unwrap();
+        let out = dest.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("sentinel.txt"), b"keep me").unwrap();
+
+        let err = archive
+            .extract_with_options(&out, ExtractOptions::default().with_depth_limit(1))
+            .expect_err("entry deeper than the limit");
+
+        assert!(
+            matches!(err, ZipError::DepthLimitExceeded { depth: 2, limit: 1 }),
+            "unexpected error: {err:?}"
+        );
+        assert_dir_contains_only(&out, &["sentinel.txt"]);
+        assert_eq!(
+            std::fs::read(out.join("sentinel.txt")).unwrap(),
+            b"keep me",
+            "pre-existing content must survive a rolled-back extraction"
+        );
+
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        archive
+            .extract_with_options(&out, ExtractOptions::default().with_depth_limit(2))
+            .unwrap();
+        assert_dir_contains_only(&out, &["ok.txt", "sentinel.txt", "sub"]);
+        assert_eq!(
+            std::fs::read(out.join("sub/deep.txt")).unwrap(),
+            b"too deep"
+        );
+    }
+
+    #[test]
+    fn mid_extraction_failure_leaves_no_destination_behind() {
+        let bytes = stored_archive(&[
+            ("good.txt", b"good content"),
+            ("broken.txt", b"unique payload that will be corrupted"),
+        ]);
+        let bytes = corrupt_payload(bytes, b"unique payload that will be corrupted");
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+
+        let dest = TempDir::with_prefix("zip_rollback_fresh").unwrap();
+        let out = dest.path().join("out");
+        archive
+            .extract(&out)
+            .expect_err("corrupted payload must fail the extraction");
+
+        assert!(
+            !out.exists(),
+            "a failed extraction into a fresh path must remove everything it created"
+        );
+    }
+
+    #[test]
+    fn mid_extraction_failure_restores_preexisting_destination() {
+        let bytes = stored_archive(&[
+            ("good.txt", b"good content"),
+            ("sub/nested.txt", b"nested content"),
+            ("broken.txt", b"unique payload that will be corrupted"),
+        ]);
+        let bytes = corrupt_payload(bytes, b"unique payload that will be corrupted");
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+
+        let dest = TempDir::with_prefix("zip_rollback_existing").unwrap();
+        let out = dest.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("sentinel.txt"), b"keep me").unwrap();
+
+        archive
+            .extract(&out)
+            .expect_err("corrupted payload must fail the extraction");
+
+        assert_dir_contains_only(&out, &["sentinel.txt"]);
+        assert_eq!(std::fs::read(out.join("sentinel.txt")).unwrap(), b"keep me");
+    }
+
+    #[cfg(feature = "rayon")]
+    mod parallel {
+        use super::*;
+
+        #[test]
+        fn par_size_limit_counts_actual_bytes_and_rolls_back() {
+            let bytes = streaming_archive(&[
+                ("a.txt", b"01234567890123456789"),
+                ("b.txt", b"01234567890123456789"),
+                ("c.txt", b"01234567890123456789"),
+                ("d.txt", b"01234567890123456789"),
+            ]);
+            let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+            assert_eq!(archive.decompressed_size(), None);
+
+            let dest = TempDir::with_prefix("zip_par_quota_bytes").unwrap();
+            let out = dest.path().join("out");
+            let err = archive
+                .par_extract_with_options(&out, ExtractOptions::default().with_size_limit(40))
+                .expect_err("actual decompressed bytes exceed the limit");
+
+            match err {
+                ZipError::DecompressedSizeLimitExceeded { size, limit } => {
+                    assert_eq!(limit, 40);
+                    assert!(
+                        size > u128::from(limit),
+                        "recorded size must reflect the breach"
+                    );
+                }
+                other => panic!("expected DecompressedSizeLimitExceeded, got {other:?}"),
+            }
+            assert!(
+                !out.exists(),
+                "failed parallel extraction must not leave a half-written destination"
+            );
+        }
+
+        #[test]
+        fn par_entry_limit_rejects_before_writing_anything() {
+            let bytes = stored_archive(&[("a.txt", b"aaa"), ("b.txt", b"bbb"), ("c.txt", b"ccc")]);
+            let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+
+            let dest = TempDir::with_prefix("zip_par_quota_entries").unwrap();
+            let out = dest.path().join("out");
+            let err = archive
+                .par_extract_with_options(&out, ExtractOptions::default().with_entry_limit(2))
+                .expect_err("entry count exceeds the limit");
+
+            assert!(
+                matches!(
+                    err,
+                    ZipError::EntryLimitExceeded {
+                        entries: 3,
+                        limit: 2
+                    }
+                ),
+                "unexpected error: {err:?}"
+            );
+            assert!(!out.exists(), "rejection must not create the destination");
+        }
+
+        #[test]
+        fn par_mid_extraction_failure_rolls_back_everything_created() {
+            let bytes = stored_archive(&[
+                ("good_a.txt", b"good content a"),
+                ("good_b.txt", b"good content b"),
+                ("broken.txt", b"unique payload that will be corrupted"),
+            ]);
+            let bytes = corrupt_payload(bytes, b"unique payload that will be corrupted");
+            let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+
+            let dest = TempDir::with_prefix("zip_par_rollback").unwrap();
+            let out = dest.path().join("out");
+            std::fs::create_dir(&out).unwrap();
+            std::fs::write(out.join("sentinel.txt"), b"keep me").unwrap();
+
+            archive
+                .par_extract(&out)
+                .expect_err("corrupted payload must fail the extraction");
+
+            assert_dir_contains_only(&out, &["sentinel.txt"]);
+            assert_eq!(std::fs::read(out.join("sentinel.txt")).unwrap(), b"keep me");
+        }
+    }
+}

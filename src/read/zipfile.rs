@@ -311,7 +311,24 @@ impl<'a, R: Read + ?Sized> ZipFile<'a, R> {
         base_path: &Path,
         root_dir: Option<&(Vec<&OsStr>, impl RootDirFilter)>,
     ) -> ZipResult<PathBuf> {
-        safe_prepare_path_from_metadata(&self.file_name_raw, &self.data, base_path, root_dir)
+        safe_prepare_path_from_metadata(&self.file_name_raw, &self.data, base_path, root_dir, None)
+    }
+
+    /// Like [`ZipFile::safe_prepare_path`], but records directories created
+    /// along the way in `created` for failure rollback.
+    pub(crate) fn safe_prepare_path_tracked(
+        &self,
+        base_path: &Path,
+        root_dir: Option<&(Vec<&OsStr>, impl RootDirFilter)>,
+        created: &mut crate::read::extract::CreatedPaths,
+    ) -> ZipResult<PathBuf> {
+        safe_prepare_path_from_metadata(
+            &self.file_name_raw,
+            &self.data,
+            base_path,
+            root_dir,
+            Some(created),
+        )
     }
 
     /// Get the extra data of the zip header for this file
@@ -474,6 +491,7 @@ pub(crate) fn safe_prepare_path_from_metadata<Filter: RootDirFilter>(
     data: &ZipFileData,
     base_path: &Path,
     root_dir: Option<&(Vec<&OsStr>, Filter)>,
+    created: Option<&mut crate::read::extract::CreatedPaths>,
 ) -> ZipResult<PathBuf> {
     let file_name = data.name(file_name_raw)?;
     let components = data
@@ -494,5 +512,11 @@ pub(crate) fn safe_prepare_path_from_metadata<Filter: RootDirFilter>(
         None => &components[..],
     };
 
-    crate::path::resolve_enclosed(base_path, base_path, components.iter().copied(), true)
+    crate::path::resolve_enclosed_tracked(
+        base_path,
+        base_path,
+        components.iter().copied(),
+        true,
+        created,
+    )
 }

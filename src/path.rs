@@ -370,6 +370,19 @@ pub(crate) fn resolve_enclosed<'a>(
     components: impl IntoIterator<Item = impl Into<Cow<'a, OsStr>>>,
     create_dirs: bool,
 ) -> ZipResult<PathBuf> {
+    resolve_enclosed_tracked(base, start, components, create_dirs, None)
+}
+
+/// Like [`resolve_enclosed`], but records every directory created along the
+/// way in `created`, so a failed extraction can roll the destination back to
+/// its pre-call state.
+pub(crate) fn resolve_enclosed_tracked<'a>(
+    base: &Path,
+    start: &Path,
+    components: impl IntoIterator<Item = impl Into<Cow<'a, OsStr>>>,
+    create_dirs: bool,
+    mut created: Option<&mut crate::read::extract::CreatedPaths>,
+) -> ZipResult<PathBuf> {
     debug_assert!(start.starts_with(base));
 
     let mut current = start.to_path_buf();
@@ -425,6 +438,9 @@ pub(crate) fn resolve_enclosed<'a>(
             // symlink whose target does not exist (yet) to be accepted.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if create_dirs && !queue.is_empty() {
+                    if let Some(tracker) = created.as_deref_mut() {
+                        tracker.track_created_dir(&current);
+                    }
                     make_writable_dir_all(&current)?;
                 } else {
                     missing = true;
